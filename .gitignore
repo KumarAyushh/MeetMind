@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Environment files (contain secrets) — only .env.example is committed
+.env
+.env.*
+!.env.example
+
+# Logs & OS junk
+*.log
+.DS_Store

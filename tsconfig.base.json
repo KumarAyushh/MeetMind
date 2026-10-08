@@ -1,0 +1,16 @@
+// Shared TypeScript settings. Each package has its own tsconfig.json that
+// "extends" this file, so strictness rules stay identical across the monorepo.
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "strict": true,                 // turns on all strict type checks (catches most bugs early)
+    "noUncheckedIndexedAccess": true, // arr[i] is typed as T | undefined, forcing safe access
+    "esModuleInterop": true,        // lets us `import express from "express"` for CommonJS libs
+    "skipLibCheck": true,           // don't type-check node_modules .d.ts files (faster builds)
+    "forceConsistentCasingInFileNames": true, // Linux is case-sensitive; avoid "works on my Mac" bugs
+    "resolveJsonModule": true,      // allow importing .json files
+    "isolatedModules": true,        // each file must compile on its own (needed by Vite/tsx)
+    "declaration": true,            // emit .d.ts files so packages can share types
+    "sourceMap": true               // map compiled JS back to TS for debugging
+  }
+}

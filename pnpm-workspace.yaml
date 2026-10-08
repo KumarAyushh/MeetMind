@@ -1,0 +1,6 @@
+# Tells pnpm which folders contain workspace packages.
+# Every folder matching these globs that has a package.json becomes a package
+# that other packages can depend on with "workspace:*".
+packages:
+  - "apps/*"      # runnable applications (api server, web frontend)
+  - "packages/*"  # shared libraries used by the apps (types, Zod schemas)
