@@ -14,3 +14,6 @@ build/
 # Logs & OS junk
 *.log
 .DS_Store
+
+# Prisma client is generated code (rebuilt by `prisma generate` on install)
+apps/api/src/generated/

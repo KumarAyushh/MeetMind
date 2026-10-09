@@ -1,0 +1,17 @@
+// Prisma schema: the single source of truth for our database tables.
+// Models (User, Workspace, Meeting, Task, ...) are added in Phase 3.
+// After editing, run `pnpm db:migrate` to create a migration and regenerate
+// the client.
+
+generator client {
+  // "prisma-client" is the Prisma 7 generator: it writes plain TypeScript
+  // into our source tree instead of hiding it inside node_modules.
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  // The connection URL comes from prisma.config.ts (CLI) and from the
+  // PrismaPg adapter in src/config/prisma.ts (runtime).
+  provider = "postgresql"
+}
