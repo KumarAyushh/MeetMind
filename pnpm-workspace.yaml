@@ -4,3 +4,11 @@
 packages:
   - "apps/*"      # runnable applications (api server, web frontend)
   - "packages/*"  # shared libraries used by the apps (types, Zod schemas)
+
+# pnpm 10 blocks dependency install scripts by default (supply-chain safety).
+# These packages need theirs: Prisma downloads its engines, esbuild (used by
+# tsx) installs its native binary.
+onlyBuiltDependencies:
+  - "@prisma/engines"
+  - esbuild
+  - prisma

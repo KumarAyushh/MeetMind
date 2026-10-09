@@ -4,7 +4,8 @@
     "module": "NodeNext",           // Node's native module resolution
     "moduleResolution": "NodeNext",
     "outDir": "dist",
-    "rootDir": "src"
+    "rootDir": "src",
+    "declaration": false            // an app isn't imported by others, so no .d.ts files needed
   },
   "include": ["src"]
 }
