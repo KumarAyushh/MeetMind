@@ -1,17 +1,289 @@
 // Prisma schema: the single source of truth for our database tables.
-// Models (User, Workspace, Meeting, Task, ...) are added in Phase 3.
-// After editing, run `pnpm db:migrate` to create a migration and regenerate
-// the client.
+// After editing, run `pnpm --filter @meetingmind/api db:migrate` to create a
+// migration (a SQL file in prisma/migrations/) and regenerate the client.
+//
+// Conventions used below:
+//   - Every id is a UUID stored in Postgres' native `uuid` type (@db.Uuid),
+//     which is 16 bytes instead of a 36-character string.
+//   - Every point in time is `timestamptz` (@db.Timestamptz(3)): Postgres
+//     stores it as UTC and converts on read, so raw SQL, psql and other tools
+//     all agree on what "now" means. (3) = millisecond precision, matching
+//     JavaScript's Date.
+//   - Prisma's `String` maps to Postgres `text` (unlimited length), so long
+//     fields like transcripts need no special annotation. Length limits are
+//     enforced by Zod at the API boundary instead.
+//   - Table and column names are left as Prisma's defaults (e.g. "Task",
+//     "workspaceId"). In raw SQL they must be double-quoted: "Task"."workspaceId".
+//
+// Account deletion policy: we keep history. Deleting a user removes their
+// sessions and memberships, but meetings and tasks they touched survive with
+// the user link set to null (the UI shows "Deleted user").
 
 generator client {
   // "prisma-client" is the Prisma 7 generator: it writes plain TypeScript
   // into our source tree instead of hiding it inside node_modules.
-  provider = "prisma-client"
-  output   = "../src/generated/prisma"
+  provider        = "prisma-client"
+  output          = "../src/generated/prisma"
+  // Lets us declare partial indexes (an index with a WHERE clause) in this
+  // file. Used for the "one OWNER per workspace" rule below.
+  previewFeatures = ["partialIndexes"]
 }
 
 datasource db {
   // The connection URL comes from prisma.config.ts (CLI) and from the
   // PrismaPg adapter in src/config/prisma.ts (runtime).
   provider = "postgresql"
+}
+
+// ─── Enums ─────────────────────────────────────────────────────────────────
+// Postgres stores these as real enum types, so the DB itself rejects a value
+// like status = 'BLOCKED'. The same values will be mirrored as Zod enums in
+// packages/shared so the frontend uses identical strings.
+
+enum WorkspaceRole {
+  OWNER // exactly one per workspace; can delete it and manage admins
+  ADMIN // can manage members and all content
+  MEMBER // can create/edit meetings and tasks
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  DONE
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+// Lifecycle of the background AI job that analyses a meeting transcript.
+enum ProcessingStatus {
+  PENDING // saved, job queued but not picked up yet
+  PROCESSING // a BullMQ worker is talking to the LLM right now
+  COMPLETED // summary, decisions and tasks have been written
+  FAILED // the job gave up after its retries
+}
+
+// ─── Users & auth ──────────────────────────────────────────────────────────
+
+model User {
+  id           String  @id @default(uuid()) @db.Uuid
+  name         String
+  // Unique so two accounts can't share an email. We lowercase emails in the
+  // Zod schema before saving, so "A@x.com" and "a@x.com" can't both sign up.
+  email        String  @unique
+  // Only the bcrypt/argon2 hash is stored, never the plain password.
+  passwordHash String
+  avatar       String? // URL of a profile picture; optional
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3) // Prisma sets this on every update
+
+  // "Back-relations": these are not columns. They let us write queries like
+  // prisma.user.findUnique({ include: { memberships: true } }).
+  memberships     WorkspaceMember[]
+  meetingsCreated Meeting[]         @relation("MeetingCreator")
+  assignedTasks   Task[]            @relation("TaskAssignee")
+  createdTasks    Task[]            @relation("TaskCreator")
+  refreshTokens   RefreshToken[]
+}
+
+// One row per issued refresh token (Phase 4). Storing them lets us log a user
+// out (revoke) and rotate tokens: each refresh marks the old row revoked and
+// issues a new one, so a stolen, already-used token stops working.
+model RefreshToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  // SHA-256 of the token, not the token itself, so a leaked DB dump can't be
+  // used to log in. Unique so we can look a token up directly by its hash.
+  tokenHash String    @unique
+  expiresAt DateTime  @db.Timestamptz(3)
+  revokedAt DateTime? @db.Timestamptz(3) // null = still valid (if not expired)
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+
+  // Deleting a user deletes their sessions too.
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId]) // "log out everywhere" = revoke all rows for a user
+}
+
+// ─── Workspaces (multi-tenancy) ────────────────────────────────────────────
+// A workspace is a tenant: every meeting, task and chunk belongs to exactly
+// one workspace, and every query must filter by workspaceId so one team can
+// never see another team's data.
+
+model Workspace {
+  id   String @id @default(uuid()) @db.Uuid
+  name String
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  // There is deliberately no ownerId column: the owner is the member whose
+  // role is OWNER. Creating a workspace must therefore insert the workspace
+  // AND its OWNER membership in one transaction (Phase 5).
+  members  WorkspaceMember[]
+  meetings Meeting[]
+  tasks    Task[]
+  chunks   MeetingChunk[]
+}
+
+// Join table between User and Workspace (a many-to-many relation), with the
+// user's role in that workspace as extra data on the link.
+model WorkspaceMember {
+  id          String        @id @default(uuid()) @db.Uuid
+  workspaceId String        @db.Uuid
+  userId      String        @db.Uuid
+  role        WorkspaceRole @default(MEMBER)
+  joinedAt    DateTime      @default(now()) @db.Timestamptz(3)
+
+  // onDelete: Cascade = deleting the workspace (or the user) removes the
+  // membership row automatically instead of failing with a FK error.
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // A user can join a given workspace only once. This unique index also
+  // serves the hot query "is user X a member of workspace Y?" used by the
+  // auth middleware on every workspace request.
+  @@unique([workspaceId, userId])
+  // At most ONE owner per workspace, enforced by Postgres: a unique index
+  // that only covers rows WHERE role = 'OWNER' (a "partial" index), so a
+  // second OWNER row for the same workspace is rejected (error P2002).
+  // "At least one owner" can't be expressed as an index; the Phase 5 service
+  // must refuse to remove or demote the last owner.
+  @@unique([workspaceId], map: "WorkspaceMember_one_owner_per_workspace", where: raw("\"role\" = 'OWNER'"))
+  @@index([userId]) // "list the workspaces I belong to"
+}
+
+// ─── Meetings ──────────────────────────────────────────────────────────────
+
+model Meeting {
+  id          String  @id @default(uuid()) @db.Uuid
+  workspaceId String  @db.Uuid
+  createdById String? @db.Uuid // null once the creator's account is deleted
+  title       String
+  transcript  String // raw pasted text; can be very long (Postgres text)
+
+  // Filled in by the AI worker (Phase 8), so empty until processing finishes.
+  summary          String?
+  decisions        String[]         @default([]) // Postgres text[] array
+  processingStatus ProcessingStatus @default(PENDING)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  createdBy User?     @relation("MeetingCreator", fields: [createdById], references: [id], onDelete: SetNull)
+
+  tasks  Task[]
+  chunks MeetingChunk[]
+
+  // `id` alone is already unique, so this pair is too. We declare it anyway
+  // because a foreign key can only point at columns with a unique index, and
+  // Task / MeetingChunk point at (workspaceId, id) together. That's what makes
+  // Postgres reject "task in workspace A linked to a meeting in workspace B".
+  @@unique([workspaceId, id])
+  // The meetings page lists a workspace's meetings newest first.
+  @@index([workspaceId, createdAt])
+}
+
+// ─── Tasks (Kanban cards) ──────────────────────────────────────────────────
+
+model Task {
+  id          String       @id @default(uuid()) @db.Uuid
+  workspaceId String       @db.Uuid
+  title       String
+  description String?
+  status      TaskStatus   @default(TODO)
+  priority    TaskPriority @default(MEDIUM)
+  // A calendar day ("due Friday"), not an instant, so there's no timezone to
+  // get wrong. Overdue check (Phase 11): dueDate < CURRENT_DATE.
+  dueDate     DateTime?    @db.Date
+
+  // Order of the card inside its column (lower = higher up). New cards get
+  // gaps of 1000 (1000, 2000, 3000...). Dropping a card between two others
+  // takes the midpoint (1000 and 2000 → 1500), so one drag updates one row.
+  // When two neighbours are adjacent (e.g. 1500 and 1501), the service
+  // renumbers that column back to clean gaps (Phase 7). No default on purpose:
+  // the service must always choose a position.
+  position Int
+
+  // Where the task came from. Both are optional:
+  //   - meetingId set   → extracted by AI from that meeting
+  //   - createdById set → created by hand by that user
+  meetingId   String? @db.Uuid
+  createdById String? @db.Uuid
+  assigneeId  String? @db.Uuid // null = unassigned
+
+  // Extra context saved by the AI extraction (Phase 8):
+  //   - sourceQuote: the transcript lines the action item came from, so
+  //     whoever picks up the task weeks later can see *why* it exists.
+  //   - extractedAssigneeName: the name the AI heard ("Rahul"). Kept even
+  //     when we can't match it to a workspace member, so nobody has to
+  //     re-read the transcript to find out who was meant.
+  sourceQuote           String?
+  extractedAssigneeName String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  // Composite foreign key: (workspaceId, meetingId) must match a meeting's
+  // (workspaceId, id), so a task can only link to a meeting in ITS OWN
+  // workspace. When meetingId is null, Postgres skips the check entirely.
+  // NoAction: deleting a meeting that still has tasks fails, so the Phase 6
+  // service must first set those tasks' meetingId to null, in the same
+  // transaction. (We can't use SetNull here: it would also null workspaceId.)
+  meeting   Meeting?  @relation(fields: [workspaceId, meetingId], references: [workspaceId, id], onDelete: NoAction)
+  // SetNull: deleting the user keeps the task, just unlinks it. Whether the
+  // assignee is a member of this workspace is checked in the service, since
+  // members can leave while their old tasks stay.
+  assignee  User?     @relation("TaskAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+  createdBy User?     @relation("TaskCreator", fields: [createdById], references: [id], onDelete: SetNull)
+
+  // The board loads a workspace's tasks grouped by column and ordered by
+  // position. This one index covers that query (and plain workspaceId+status
+  // lookups too, since Postgres can use the leading columns of an index).
+  @@index([workspaceId, status, position])
+  @@index([assigneeId]) // "my tasks"
+  @@index([meetingId]) // "tasks from this meeting"
+}
+
+// ─── RAG chunks (Phase 10) ─────────────────────────────────────────────────
+// Each meeting transcript is split into overlapping chunks of text; each chunk
+// gets an embedding vector so we can find the chunks most similar to a
+// user's question.
+
+model MeetingChunk {
+  // gen_random_uuid() is a DB-side default (unlike uuid() above, which Prisma
+  // fills in from Node). Chunks are inserted with raw SQL because of the
+  // vector column, so the database itself must be able to generate the id.
+  id          String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  meetingId   String @db.Uuid
+  // Copied from the meeting (denormalised) so vector search can filter by
+  // workspace directly, without a JOIN. The composite foreign key below
+  // guarantees the copy always matches the meeting's real workspace.
+  workspaceId String @db.Uuid
+  chunkIndex  Int // 0, 1, 2... position of the chunk within the transcript
+  content     String
+
+  // Prisma has no vector type, so it's "Unsupported": the column exists and
+  // migrations manage it, but we read/write it with $queryRaw / $executeRaw.
+  // 768 = the dimension of Gemini's embedding model.
+  embedding Unsupported("vector(768)")
+
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  // Composite FK, like Task.meeting: the chunk's workspaceId must be the
+  // meeting's workspaceId. Cascade: deleting a meeting deletes its chunks.
+  meeting   Meeting   @relation(fields: [workspaceId, meetingId], references: [workspaceId, id], onDelete: Cascade)
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  // The vector similarity index (HNSW) is added in Phase 10 with raw SQL,
+  // once we've settled on the distance metric (cosine).
+
+  // A meeting can't have two "chunk 3"s. Also indexes lookups by meetingId.
+  @@unique([meetingId, chunkIndex])
+  @@index([workspaceId])
 }
